@@ -125,22 +125,54 @@ async function connectToWhatsApp(sessionId, sessionInfo) {
         name: userName
       });
     }
-
+    
+    /* CONNECTION CLOSED */
     if (connection === 'close') {
+      const code = lastDisconnect?.error?.output?.statusCode;
       const reason = lastDisconnect?.error?.output?.payload?.error || 'unknown';
-      console.log(`[${sessionId}] ⚠️ Connection closed: ${reason}`);
 
+      console.log(`[${sessionId}] ⚠️ Connection closed: ${reason} (Code: ${code})`);
+
+      /* ⭐ AUTO-LOGOUT WHEN USER UNLINKS DEVICE FROM WHATSAPP ⭐ */
+      if (code === 401) {
+        console.log(`[${sessionId}] 🔥 User logged out directly from WhatsApp`);
+        
+        // Clean up local session
+        sessions.delete(sessionId);
+        
+        // Notify backend about the logout
+        await notifyBackend(sessionId, 'user_logout', {
+          reason: 'logged_out_from_whatsapp',
+          message: 'User removed device from WhatsApp',
+          timestamp: new Date().toISOString()
+        });
+        
+        // Clean up auth files
+        const authPath = `./auth_info_baileys/${sessionId}`;
+        try {
+          await fs.promises.rm(authPath, { recursive: true, force: true });
+          console.log(`[${sessionId}] 🗑️ Auth files deleted`);
+        } catch (err) {
+          console.log(`[${sessionId}] ⚠️ Could not delete auth files: ${err.message}`);
+        }
+        
+        return; // Stop reconnection attempts
+      }
+
+      /* NORMAL RECONNECT BEHAVIOR FOR OTHER ERRORS */
       if (sessionInfo.retries >= MAX_RETRIES) {
         console.log(`[${sessionId}] ❌ Max retries reached`);
         sessions.delete(sessionId);
         await notifyBackend(sessionId, 'disconnected', { reason: 'max_retries' });
       } else {
         sessionInfo.retries++;
+        console.log(`[${sessionId}] 🔄 Reconnecting (attempt ${sessionInfo.retries}/${MAX_RETRIES})...`);
         setTimeout(() => connectToWhatsApp(sessionId, sessionInfo), 3000);
       }
     }
   });
 
+   
   /* MESSAGE RECEIVED */
   sock.ev.on('messages.upsert', async ({ messages, type }) => {
     if (type !== 'notify') return;
@@ -190,7 +222,7 @@ async function notifyBackend(sessionId, event, data) {
     else if (event === 'connected') endpoint = '/whatsapp/webhook/connected';
     else if (event === 'message_received') endpoint = '/whatsapp/webhook/message';
     else if (event === 'disconnected') endpoint = '/whatsapp/webhook/disconnect';
-
+    else if (event === 'user_logout') endpoint = '/whatsapp/webhook/user-logout';
     await axios.post(`${BACKEND_URL}${endpoint}`, {
       session_id: sessionId,
       event,
