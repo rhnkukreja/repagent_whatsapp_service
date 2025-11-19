@@ -20,14 +20,14 @@ const reviver = (key, value) => {
 };
 
 /* ============================================================
-   SUPABASE AUTH STATE FOR BAILEYS
+   SUPABASE AUTH STATE (OPTIMIZED FOR SCALING)
 ============================================================ */
 export async function useSupabaseAuthState(sessionId, logger, opts = {}) {
-  /* --------------------------------------
-     ALWAYS LOAD AUTH DATA FROM SUPABASE
-  ----------------------------------------- */
+  
+  // 1. LOAD DATA
   async function loadAuth() {
-    console.log(`📂 [${sessionId}] Loading WhatsApp auth from Supabase...`);
+    // console.log(`📂 [${sessionId}] Loading WhatsApp auth...`); 
+    // (Commented out log to keep terminal clean with 100 users)
 
     const { data, error } = await supabase
       .from("whatsapp_sessions")
@@ -41,40 +41,47 @@ export async function useSupabaseAuthState(sessionId, logger, opts = {}) {
     }
 
     if (!data?.auth_data) {
-      console.log(`🆕 [${sessionId}] No saved login → starting fresh`);
       return { creds: initAuthCreds(), keys: {} };
     }
 
-    console.log(`✅ [${sessionId}] WhatsApp session restored from Supabase`);
     return JSON.parse(JSON.stringify(data.auth_data), reviver);
   }
 
   let sessionCache = await loadAuth();
+  let saveTimeout = null;
 
-  /* --------------------------------------
-     SAVE AUTH BACK TO SUPABASE
-  ----------------------------------------- */
-  async function saveAuth() {
-    try {
-      const serialized = JSON.parse(JSON.stringify(sessionCache, replacer));
+  // 2. SAVE DATA (WITH DEBOUNCE)
+  // This prevents writing to DB 50 times a second. It batches writes.
+  async function saveAuth(force = false) {
+    if (saveTimeout && !force) return; // If waiting to save, skip
+    if (saveTimeout) clearTimeout(saveTimeout);
 
-      const row = {
-        id: sessionId,
-        user_id: opts.user_id || sessionId,
-        status: "connected",
-        updated_at: new Date().toISOString(),
-        auth_data: serialized,
-      };
+    const executeSave = async () => {
+      try {
+        const serialized = JSON.parse(JSON.stringify(sessionCache, replacer));
+        const row = {
+          id: sessionId,
+          user_id: opts.user_id || sessionId,
+          status: "connected",
+          updated_at: new Date().toISOString(),
+          auth_data: serialized,
+        };
 
-      const { error } = await supabase
-        .from("whatsapp_sessions")
-        .upsert(row, { onConflict: "id" });
+        const { error } = await supabase
+          .from("whatsapp_sessions")
+          .upsert(row, { onConflict: "id" });
 
-      if (error) throw error;
+        if (error) throw error;
+      } catch (e) {
+        console.error(`❌ [${sessionId}] Save Error:`, e.message);
+      }
+    };
 
-      console.log(`💾 [${sessionId}] WhatsApp auth saved to Supabase`);
-    } catch (e) {
-      console.error(`❌ [${sessionId}] Error saving auth:`, e.message);
+    if (force) {
+      await executeSave();
+    } else {
+      // Wait 10 seconds before actually writing to DB
+      saveTimeout = setTimeout(executeSave, 10000);
     }
   }
 
@@ -90,18 +97,18 @@ export async function useSupabaseAuthState(sessionId, logger, opts = {}) {
           }, {});
         },
         set: (data) => {
-          console.log(`🔑 [${sessionId}] Keys updated`);
           for (const type in data) {
             sessionCache.keys[type] = sessionCache.keys[type] || {};
             Object.assign(sessionCache.keys[type], data[type]);
           }
-          saveAuth();
+          // Soft save (throttled)
+          saveAuth(false);
         },
       },
     },
     saveCreds: async () => {
-      console.log(`🔐 [${sessionId}] Creds updated`);
-      await saveAuth();
+      // Critical update (always save immediately)
+      await saveAuth(true);
     },
   };
 }
