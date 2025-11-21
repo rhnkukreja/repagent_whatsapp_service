@@ -1,0 +1,21 @@
+# fly.toml app configuration file generated for repagent-whatsapp-service on 2025-11-11T12:53:07+05:30
+#
+# See https://fly.io/docs/reference/configuration/ for information about how to use this file.
+#
+
+app = 'repagent-whatsapp-service'
+primary_region = 'bom'
+
+[build]
+
+[http_service]
+  internal_port = 3001
+  force_https = true
+  auto_stop_machines = false
+  min_machines_running = 1
+  processes = ['app']
+
+[[vm]]
+  memory = '1gb'
+  cpu_kind = 'shared'
+  cpus = 1

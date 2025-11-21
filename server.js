@@ -262,7 +262,7 @@ else {
             sessions.delete(sessionId); 
             notifyBackend(sessionId, 'user_logout', {}); 
           }
-          else setTimeout(() => connectToWhatsApp(sessionId, sessionInfo), 5000);
+          // else setTimeout(() => connectToWhatsApp(sessionId, sessionInfo), 5000);
         }
       });
 
