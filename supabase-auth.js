@@ -20,14 +20,13 @@ const reviver = (key, value) => {
 };
 
 /* ============================================================
-   SUPABASE AUTH STATE (OPTIMIZED FOR SCALING)
+   SUPABASE AUTH STATE (FIXED)
 ============================================================ */
 export async function useSupabaseAuthState(sessionId, logger, opts = {}) {
   
   // 1. LOAD DATA
   async function loadAuth() {
-    // console.log(`📂 [${sessionId}] Loading WhatsApp auth...`); 
-    // (Commented out log to keep terminal clean with 100 users)
+    console.log(`📂 [${sessionId}] Loading WhatsApp auth from DB...`);
 
     const { data, error } = await supabase
       .from("whatsapp_sessions")
@@ -41,23 +40,42 @@ export async function useSupabaseAuthState(sessionId, logger, opts = {}) {
     }
 
     if (!data?.auth_data) {
+      console.log(`⚠️ [${sessionId}] No auth data found - creating new session`);
       return { creds: initAuthCreds(), keys: {} };
     }
 
+    console.log(`✅ [${sessionId}] Auth data loaded successfully`);
     return JSON.parse(JSON.stringify(data.auth_data), reviver);
   }
 
   let sessionCache = await loadAuth();
   let saveTimeout = null;
+  let isSaving = false;
 
-  // 2. SAVE DATA (WITH DEBOUNCE)
-  // This prevents writing to DB 50 times a second. It batches writes.
+  // 2. SAVE DATA (WITH SMART DEBOUNCE)
   async function saveAuth(force = false) {
-    if (saveTimeout && !force) return; // If waiting to save, skip
+    // If already saving, don't queue another save
+    if (isSaving) {
+      console.log(`⏳ [${sessionId}] Save already in progress, queueing next save`);
+      if (saveTimeout) clearTimeout(saveTimeout);
+      if (!force) {
+        saveTimeout = setTimeout(() => saveAuth(true), 2000);
+      }
+      return;
+    }
+
+    if (saveTimeout && !force) {
+      // Already waiting, skip
+      return;
+    }
+
     if (saveTimeout) clearTimeout(saveTimeout);
 
     const executeSave = async () => {
       try {
+        isSaving = true;
+        console.log(`💾 [${sessionId}] Saving auth to DB...`);
+
         const serialized = JSON.parse(JSON.stringify(sessionCache, replacer));
         const row = {
           id: sessionId,
@@ -72,16 +90,25 @@ export async function useSupabaseAuthState(sessionId, logger, opts = {}) {
           .upsert(row, { onConflict: "id" });
 
         if (error) throw error;
+        
+        console.log(`✅ [${sessionId}] Auth saved successfully`);
+        isSaving = false;
+        saveTimeout = null;
       } catch (e) {
         console.error(`❌ [${sessionId}] Save Error:`, e.message);
+        isSaving = false;
+        // Retry in 3 seconds
+        saveTimeout = setTimeout(executeSave, 3000);
       }
     };
 
     if (force) {
+      // CRITICAL: Save immediately (e.g., after QR scan, after creds update)
       await executeSave();
     } else {
-      // Wait 10 seconds before actually writing to DB
-      saveTimeout = setTimeout(executeSave, 10000);
+      // NON-CRITICAL: Wait 3 seconds before saving (shorter than before)
+      console.log(`⏰ [${sessionId}] Scheduling auth save in 3s...`);
+      saveTimeout = setTimeout(executeSave, 3000);
     }
   }
 
@@ -101,13 +128,17 @@ export async function useSupabaseAuthState(sessionId, logger, opts = {}) {
             sessionCache.keys[type] = sessionCache.keys[type] || {};
             Object.assign(sessionCache.keys[type], data[type]);
           }
-          // Soft save (throttled)
-          saveAuth(false);
+          // CRITICAL: Force immediate save for key updates
+          // (These are sensitive - don't wait 3 seconds)
+          console.log(`🔑 [${sessionId}] Keys updated - forcing immediate save`);
+          saveAuth(true);
         },
       },
     },
     saveCreds: async () => {
-      // Critical update (always save immediately)
+      // CRITICAL: Always save credentials immediately
+      // These are the most important - they determine if the session is valid
+      console.log(`🔐 [${sessionId}] Credentials updated - forcing immediate save`);
       await saveAuth(true);
     },
   };
