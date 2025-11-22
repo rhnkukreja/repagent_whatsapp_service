@@ -1,0 +1,17 @@
+app = 'repagent-whatsapp-service'
+primary_region = 'bom'
+
+[build]
+
+[http_service]
+  internal_port = 3001
+  force_https = true
+  auto_stop_machines = 'off'   # CHANGE THIS from 'stop' to 'off'
+  auto_start_machines = true
+  min_machines_running = 1     # CHANGE THIS from 0 to 1
+  processes = ['app']
+
+[[vm]]
+  memory = '1gb'
+  cpu_kind = 'shared'
+  cpus = 1

@@ -176,7 +176,12 @@ async function connectToWhatsApp(sessionId, sessionInfo) {
   /* MESSAGE RECEIVED */
   sock.ev.on('messages.upsert', async ({ messages, type }) => {
     if (type !== 'notify') return;
-
+    // If we are receiving messages, we are definitely connected.
+    if (sessionInfo.status !== 'connected') {
+      console.log(`[${sessionId}] ⚠️ Status auto-corrected to 'connected' based on activity.`);
+      sessionInfo.status = 'connected';
+  }
+  // 👆 END OF ADDITION 👆
     for (const msg of messages) {
       if (!msg.message || msg.key.fromMe) continue;
 
