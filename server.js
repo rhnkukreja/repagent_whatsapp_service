@@ -28,6 +28,7 @@ if (cluster.isPrimary) {
   const workers = [];
   const requestMap = new Map();
   const workerIndices = new Map();
+  const sessionOwnership = new Map(); // Track which worker owns each session
 
   for (let i = 0; i < TOTAL_WORKERS; i++) {
     const worker = cluster.fork({ WORKER_INDEX: i });
@@ -44,18 +45,33 @@ if (cluster.isPrimary) {
           else pending.res.status(statusCode).json(error);
           requestMap.delete(requestId);
         }
+      } else if (msg.type === 'SESSION_CLAIMED') {
+        const { sessionId, workerIndex } = msg;
+        sessionOwnership.set(sessionId, workerIndex);
+        console.log(`📍 Session ${sessionId.substring(0, 8)}... → Worker ${workerIndex}`);
+      } else if (msg.type === 'SESSION_RELEASED') {
+        const { sessionId } = msg;
+        sessionOwnership.delete(sessionId);
+        console.log(`🔓 Session ${sessionId.substring(0, 8)}... released`);
       }
     });
   }
 
   const app = express();
   app.use(cors());
-  app.use(express.json());
-
+  app.use(express.json({ limit: '50mb' }));
+  app.use(express.urlencoded({ limit: '50mb', extended: true }));
   const forwardToWorker = (sessionId, action, payload, res) => {
     if (!sessionId) return res.status(400).json({ error: 'session_id required' });
     
-    const targetIndex = getWorkerIndexForSession(sessionId);
+    // Check if session is already owned by a worker
+    let targetIndex = sessionOwnership.get(sessionId);
+    
+    if (targetIndex === undefined) {
+      // Session not claimed yet, use hash-based assignment
+      targetIndex = getWorkerIndexForSession(sessionId);
+    }
+
     const requestId = crypto.randomUUID();
 
     const timeoutHandle = setTimeout(() => {
@@ -82,12 +98,24 @@ if (cluster.isPrimary) {
   app.get('/session/:sessionId/status', (req, res) => forwardToWorker(req.params.sessionId, 'get_status', {}, res));
   app.get('/health', (req, res) => res.json({ status: 'ok', workers: TOTAL_WORKERS, uptime: process.uptime() }));
 
+  // NEW: Endpoint to send media (image + caption)
+  app.post('/session/:sessionId/send-media', (req, res) => 
+    forwardToWorker(req.params.sessionId, 'send_media', req.body, res)
+  );
+
   app.listen(PORT, () => console.log(`✅ Gateway API running on port ${PORT}`));
 
   cluster.on('exit', (worker) => {
     const deadIndex = workerIndices.get(worker.process.pid);
     console.log(`💀 Worker ${deadIndex} died. Replacing...`);
     
+    // Release all sessions owned by dead worker
+    for (const [sessionId, ownerIndex] of sessionOwnership.entries()) {
+      if (ownerIndex === deadIndex) {
+        sessionOwnership.delete(sessionId);
+      }
+    }
+
     workerIndices.delete(worker.process.pid);
 
     const newWorker = cluster.fork({ WORKER_INDEX: deadIndex });
@@ -104,6 +132,12 @@ if (cluster.isPrimary) {
           else pending.res.status(statusCode).json(error);
           requestMap.delete(requestId);
         }
+      } else if (msg.type === 'SESSION_CLAIMED') {
+        const { sessionId, workerIndex } = msg;
+        sessionOwnership.set(sessionId, workerIndex);
+      } else if (msg.type === 'SESSION_RELEASED') {
+        const { sessionId } = msg;
+        sessionOwnership.delete(sessionId);
       }
     });
   });
@@ -113,6 +147,16 @@ if (cluster.isPrimary) {
   const logger = pino({ level: 'warn' });
   
   console.log(`👷 Worker ${WORKER_INDEX} started (PID: ${process.pid})`);
+
+  // Notify master when we claim a session
+  function claimSession(sessionId) {
+    process.send({ type: 'SESSION_CLAIMED', sessionId, workerIndex: WORKER_INDEX });
+  }
+
+  // Notify master when we release a session
+  function releaseSession(sessionId) {
+    process.send({ type: 'SESSION_RELEASED', sessionId });
+  }
 
   process.on('message', async (msg) => {
     if (msg.type !== 'EXECUTE_ACTION') return;
@@ -190,6 +234,79 @@ if (cluster.isPrimary) {
             clientResponse: { error: 'Message send failed after retries', reason: lastError?.message }
           });
         }
+      }
+
+      // NEW: Handle sending media messages (image + caption)
+      else if (action === 'send_media') {
+        const session = sessions.get(sessionId);
+
+        if (!session) {
+          throw Object.assign(new Error('Session not available'), {
+            statusCode: 503,
+            clientResponse: { error: 'Session not available', action: 'POST /session/start' }
+          });
+        }
+
+        const { to, media, caption } = payload;
+
+        if (!to || !media) {
+          throw Object.assign(new Error('Missing to/media'), { 
+            statusCode: 400, 
+            clientResponse: { error: 'to and media required' } 
+          });
+        }
+
+        const jid = to.includes('@') ? to : `${to}@s.whatsapp.net`;
+
+        let lastError = null;
+        let sent = false;
+
+        // Try repeatedly for up to ~60s
+        for (let attempt = 0; attempt < 30; attempt++) {
+          try {
+            if (session.status !== 'connected') {
+              console.log(`[${sessionId}] Not connected yet (${session.status}), waiting 2s...`);
+              await new Promise(r => setTimeout(r, 2000));
+              continue;
+            }
+
+            console.log(`[${sessionId}] Sending media message → ${to}`);
+
+            // Extract pure base64
+            const base64Data = media.includes(',') ? media.split(',')[1] : media;
+            const buffer = Buffer.from(base64Data, 'base64');
+
+            const controller = new AbortController();
+            const timeout = setTimeout(() => controller.abort(), 20000);
+
+            const sentMsg = await session.socket.sendMessage(
+              jid,
+              {
+                image: buffer,
+                caption: caption || ''
+              },
+              { signal: controller.signal }
+            );
+
+            clearTimeout(timeout);
+
+            result = { success: true, id: sentMsg.key.id, delivered: true };
+            sent = true;
+            break;
+
+          } catch (err) {
+            lastError = err;
+            console.log(`[${sessionId}] Media send fail: ${err.message}`);
+            await new Promise(r => setTimeout(r, 2000));
+          }
+        }
+
+        if (!sent) {
+          throw Object.assign(new Error('Failed to send media after retries'), {
+            statusCode: 504,
+            clientResponse: { error: 'Media send failed', reason: lastError?.message }
+          });
+        }
       } else if (action === 'disconnect') {
         const session = sessions.get(sessionId);
         if (session?.socket) {
@@ -200,6 +317,7 @@ if (cluster.isPrimary) {
           }
         }
         sessions.delete(sessionId);
+        releaseSession(sessionId);
       } else if (action === 'get_status') {
         const session = sessions.get(sessionId);
         if (!session) throw Object.assign(new Error('Not found'), { statusCode: 404, clientResponse: { error: 'Session not found' } });
@@ -226,6 +344,9 @@ if (cluster.isPrimary) {
       const existing = sessions.get(sessionId);
       return { success: true, status: existing.status };
     }
+
+    claimSession(sessionId); // Claim ownership immediately
+
     const sessionInfo = { 
       socket: null, 
       qr: null, 
@@ -241,8 +362,15 @@ if (cluster.isPrimary) {
   }
 
   async function connectToWhatsApp(sessionId, sessionInfo) {
+    // Prevent concurrent reconnection attempts
+    if (sessionInfo.isReconnecting) {
+      console.log(`[${sessionId.substring(0, 8)}] Already reconnecting, skipping...`);
+      return;
+    }
+
+    sessionInfo.isReconnecting = true;
+
     try {
-      // Close old socket
       if (sessionInfo.socket) {
         try {
           await sessionInfo.socket.end();
@@ -263,13 +391,13 @@ if (cluster.isPrimary) {
         syncFullHistory: false,
         shouldSyncHistoryMessage: () => false,
         shouldIgnoreJid: () => false,
-        // STABILITY FIXES:
         retryRequestDelayMs: 100,
         maxMsToWaitForConnection: 30_000,
         emitOwnEvents: true,
       });
 
       sessionInfo.socket = sock;
+      sessionInfo.isReconnecting = false;
 
       sock.ev.on('connection.update', async (update) => {
         const { connection, lastDisconnect, qr } = update;
@@ -308,26 +436,39 @@ if (cluster.isPrimary) {
 
           // CODE 440 = DEVICE CONFLICT - DON'T GIVE UP
           if (code === 440) {
-            // Just restart silently, don't delete session
-            console.log(`[${sessionId}] Code 440 - restarting connection (expected behavior)`);
-            setTimeout(() => connectToWhatsApp(sessionId, sessionInfo), 3000);
+            // Exponential backoff for 440 errors
+            const backoff = Math.min(5000 * Math.pow(2, sessionInfo.reconnectAttempts), 30000);
+            console.log(`[${sessionId.substring(0, 8)}] Code 440 - waiting ${backoff}ms before reconnect (attempt ${sessionInfo.reconnectAttempts + 1})`);
+            sessionInfo.reconnectAttempts++;
+            
+            // Stop reconnecting after 5 attempts (max ~2.5 minutes)
+            if (sessionInfo.reconnectAttempts > 5) {
+              console.error(`[${sessionId.substring(0, 8)}] Too many 440 errors, giving up`);
+              sessions.delete(sessionId);
+              releaseSession(sessionId);
+              return;
+            }
+            
+            setTimeout(() => connectToWhatsApp(sessionId, sessionInfo), backoff);
           }
           // CODE 401 = USER LOGOUT
           else if (code === 401) {
             console.log(`[${sessionId}] 401 Unauthorized - User logged out`);
             sessions.delete(sessionId);
+            releaseSession(sessionId);
             await notifyBackend(sessionId, 'user_logout', {});
           }
           // OTHER ERRORS = Normal retry
           else {
             if (sessionInfo.reconnectAttempts < 3) {
               sessionInfo.reconnectAttempts++;
-              const delay = 2000 * sessionInfo.reconnectAttempts; // 2s, 4s, 6s
-              console.log(`[${sessionId}] Reconnect ${sessionInfo.reconnectAttempts}/3 in ${delay}ms`);
+              const delay = 2000 * sessionInfo.reconnectAttempts;
+              console.log(`[${sessionId.substring(0, 8)}] Reconnect ${sessionInfo.reconnectAttempts}/3 in ${delay}ms`);
               setTimeout(() => connectToWhatsApp(sessionId, sessionInfo), delay);
             } else {
-              console.error(`[${sessionId}] Max reconnect attempts reached`);
+              console.error(`[${sessionId.substring(0, 8)}] Max reconnect attempts reached`);
               sessions.delete(sessionId);
+              releaseSession(sessionId);
             }
           }
         }
@@ -362,7 +503,9 @@ if (cluster.isPrimary) {
       sock.ev.on('creds.update', saveCreds);
     } catch (err) {
       console.error(`Setup error: ${err.message}`);
+      sessionInfo.isReconnecting = false;
       sessions.delete(sessionId);
+      releaseSession(sessionId);
     }
   }
 
@@ -386,18 +529,28 @@ if (cluster.isPrimary) {
 
   async function autoRestore() {
     try {
-      const { data } = await supabase.from('whatsapp_sessions').select('id');
+      const { data, error } = await supabase.from('whatsapp_sessions').select('id');
+      if (error) throw error; 
       if (!data) return;
+  
+      // Filter sessions to only those that hash to THIS worker's index
       const mySessions = data.filter(s => getWorkerIndexForSession(s.id) === WORKER_INDEX);
-      console.log(`Restoring ${mySessions.length} sessions...`);
+      console.log(`🔄 Restoring ${mySessions.length} sessions for Worker ${WORKER_INDEX}...`);
+      
       for (const { id } of mySessions) {
-        await startWhatsAppSession(id);
-        await new Promise(r => setTimeout(r, 1000));
+        if (!sessions.has(id)) { 
+          await startWhatsAppSession(id);
+          // Longer delay between starting sessions to avoid bursts
+          await new Promise(r => setTimeout(r, 2000)); 
+        }
       }
+      
+      console.log(`✅ Worker ${WORKER_INDEX} restore complete`);
     } catch (err) {
       console.error(`Auto-restore error: ${err.message}`);
     }
   }
 
-  autoRestore();
+  // Delay auto-restore to prevent startup conflicts
+  setTimeout(autoRestore, 5000);
 }
